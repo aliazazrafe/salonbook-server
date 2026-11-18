@@ -15,7 +15,10 @@ if (!authSecret) {
 }
 
 const mongoClient = new MongoClient(mongoUri);
-const database = mongoClient.db(process.env.MONGODB_DB_NAME || "salonbook");
+
+export const database = mongoClient.db(
+  process.env.MONGODB_DB_NAME || "salonbook"
+);
 
 const socialProviders = {
   ...(process.env.GOOGLE_CLIENT_ID && process.env.GOOGLE_CLIENT_SECRET
@@ -40,9 +43,7 @@ export const auth = betterAuth({
   appName: "SalonBook",
   baseURL: process.env.BETTER_AUTH_URL || "http://localhost:5000",
   secret: authSecret,
-  trustedOrigins: [
-    process.env.CLIENT_URL || "http://localhost:3000",
-  ],
+  trustedOrigins: [process.env.CLIENT_URL || "http://localhost:3000"],
   database: mongodbAdapter(database, {
     client: mongoClient,
   }),
