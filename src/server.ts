@@ -1,4 +1,6 @@
-﻿import "dotenv/config";
+﻿import adminRouter from "./admin.routes.js";
+import { paymentRouter, stripeWebhookRouter } from "./payment.routes.js";
+import "dotenv/config";
 import express from "express";
 import cors from "cors";
 import { ObjectId } from "mongodb";
@@ -22,6 +24,14 @@ const timeOptions = [
   "07:00 PM",
 ];
 
+const activeServiceFilter = {
+  $or: [
+    { isActive: true },
+    { active: true },
+    { status: { $regex: "^active$", $options: "i" } },
+  ],
+};
+
 app.use(
   cors({
     origin: clientUrl,
@@ -32,7 +42,138 @@ app.use(
 // Mount Better Auth before express.json().
 app.all("/api/auth/*splat", toNodeHandler(auth));
 
+// Stripe needs the raw request body for webhook signature verification.
+app.use("/api/payments/webhook", stripeWebhookRouter);
+
 app.use(express.json());
+app.use("/api/payments", paymentRouter);
+app.use("/api/admin", adminRouter);
+app.get("/api/services", async (req, res): Promise<void> => {
+  try {
+    const requestedLimit = Number(req.query.limit ?? 6);
+    const limit =
+      Number.isInteger(requestedLimit) && requestedLimit > 0
+        ? Math.min(requestedLimit, 50)
+        : 6;
+
+    const services = await database
+      .collection("services")
+      .find(activeServiceFilter)
+      .sort({ createdAt: -1, _id: -1 })
+      .limit(limit)
+      .toArray();
+
+    const formattedServices = services.map((service) => {
+      const status =
+        typeof service.status === "string" ? service.status : "";
+      const isActive =
+        service.isActive === true ||
+        service.active === true ||
+        status.toLowerCase() === "active";
+
+      const image =
+        typeof service.image === "string"
+          ? service.image
+          : typeof service.imageUrl === "string"
+            ? service.imageUrl
+            : "";
+
+      return {
+        _id: service._id.toString(),
+        serviceName: service.serviceName || service.name || "",
+        name: service.name || service.serviceName || "",
+        category: service.category || "Grooming",
+        description: service.description || "",
+        price: typeof service.price === "number" ? service.price : 0,
+        duration: typeof service.duration === "number" ? service.duration : 0,
+        image,
+        imageUrl: image,
+        images: Array.isArray(service.images) ? service.images : [],
+        status: status || (isActive ? "Active" : "Inactive"),
+        isActive,
+      };
+    });
+
+    res.json({
+      success: true,
+      count: formattedServices.length,
+      services: formattedServices,
+    });
+  } catch (error) {
+    console.error("Could not load active services:", error);
+
+    res.status(500).json({
+      success: false,
+      message: "Could not load services.",
+    });
+  }
+});
+
+app.get("/api/services/:id", async (req, res): Promise<void> => {
+  try {
+    const serviceId = req.params.id;
+
+    if (!ObjectId.isValid(serviceId)) {
+      res.status(400).json({
+        success: false,
+        message: "Invalid service ID.",
+      });
+      return;
+    }
+
+    const service = await database.collection("services").findOne({
+      _id: new ObjectId(serviceId),
+      ...activeServiceFilter,
+    });
+
+    if (!service) {
+      res.status(404).json({
+        success: false,
+        message: "Service not found or inactive.",
+      });
+      return;
+    }
+
+    const status =
+      typeof service.status === "string" ? service.status : "";
+    const isActive =
+      service.isActive === true ||
+      service.active === true ||
+      status.toLowerCase() === "active";
+
+    const image =
+      typeof service.image === "string"
+        ? service.image
+        : typeof service.imageUrl === "string"
+          ? service.imageUrl
+          : "";
+
+    res.json({
+      success: true,
+      service: {
+        _id: service._id.toString(),
+        serviceName: service.serviceName || service.name || "",
+        name: service.name || service.serviceName || "",
+        category: service.category || "Grooming",
+        description: service.description || "",
+        price: typeof service.price === "number" ? service.price : 0,
+        duration: typeof service.duration === "number" ? service.duration : 0,
+        image,
+        imageUrl: image,
+        images: Array.isArray(service.images) ? service.images : [],
+        status: status || (isActive ? "Active" : "Inactive"),
+        isActive,
+      },
+    });
+  } catch (error) {
+    console.error("Could not load service details:", error);
+
+    res.status(500).json({
+      success: false,
+      message: "Could not load service details.",
+    });
+  }
+});
 
 app.get("/api/appointments/mine", async (req, res): Promise<void> => {
   try {
