@@ -1,4 +1,4 @@
-import "dotenv/config";
+﻿import "dotenv/config";
 import { betterAuth } from "better-auth";
 import { admin, jwt } from "better-auth/plugins";
 import { mongodbAdapter } from "@better-auth/mongo-adapter";
@@ -14,6 +14,10 @@ if (!mongoUri) {
 if (!authSecret) {
   throw new Error("BETTER_AUTH_SECRET is missing from the server .env file");
 }
+
+const isProduction =
+  process.env.NODE_ENV === "production" ||
+  (process.env.BETTER_AUTH_URL ?? "").startsWith("https://");
 
 const mongoClient = new MongoClient(mongoUri);
 
@@ -45,6 +49,15 @@ export const auth = betterAuth({
   baseURL: process.env.BETTER_AUTH_URL || "http://localhost:5000",
   secret: authSecret,
   trustedOrigins: [process.env.CLIENT_URL || "http://localhost:3000"],
+
+  // Client (vercel.app) and server (onrender.com) are on different sites,
+  // so cookies must be SameSite=None + Secure in production, otherwise the
+  // OAuth state cookie is dropped and Google login fails with state_mismatch.
+  advanced: {
+    defaultCookieAttributes: isProduction
+      ? { sameSite: "none", secure: true }
+      : { sameSite: "lax" },
+  },
 
   user: {
     additionalFields: {
