@@ -1,4 +1,5 @@
-﻿import { Router, type Request, type Response } from "express";
+﻿import { sendAppointmentEmail } from "./email.js";
+import { Router, type Request, type Response } from "express";
 import { ObjectId } from "mongodb";
 import { fromNodeHeaders } from "better-auth/node";
 import { auth, database } from "./auth.js";
@@ -432,6 +433,8 @@ adminRouter.patch(
 
       const collection = database.collection("appointments");
       const filter = { _id: new ObjectId(appointmentId) };
+      
+      const previousAppointment = await collection.findOne(filter);
 
       const updateResult = await collection.updateOne(filter, {
         $set: {
@@ -449,6 +452,17 @@ adminRouter.patch(
       }
 
       const appointment = await collection.findOne(filter);
+      if (appointment && previousAppointment?.status !== status) {
+        await sendAppointmentEmail({
+          email: appointment.email,
+          name: appointment.name,
+          service: appointment.service,
+          barberName: appointment.barberName,
+          date: appointment.date,
+          time: appointment.time,
+          status,
+        });
+      }
 
       res.json({
         success: true,
@@ -618,7 +632,125 @@ adminRouter.get("/transactions", async (_req, res): Promise<void> => {
     });
   }
 });
+const DEFAULT_OFFER_SETTINGS = {
+  title: "Friday & Monday Special",
+  message:
+    "Offers may be changed or updated by the salon management at any time.",
+  discountPercent: 47,
+  activeDays: ["Friday", "Monday"],
+  categories: ["Skin Care", "Hair Treatment", "Spa & Massage"],
+  isActive: true,
+};
+
+const OFFER_SETTINGS_ID = "salonbook-weekly-offer";
+
+adminRouter.get("/offer-settings", async (req, res): Promise<void> => {
+  try {
+    if (!(await requireAdmin(req, res))) return;
+
+    const savedOffer = await database
+      .collection("offerSettings")
+      .findOne({ _id: OFFER_SETTINGS_ID } as any);
+
+    res.json({
+      success: true,
+      offer: savedOffer
+        ? { ...DEFAULT_OFFER_SETTINGS, ...savedOffer }
+        : DEFAULT_OFFER_SETTINGS,
+    });
+  } catch (error) {
+    console.error("Could not load offer settings:", error);
+    res.status(500).json({
+      success: false,
+      message: "Could not load offer settings.",
+    });
+  }
+});
+
+adminRouter.patch("/offer-settings", async (req, res): Promise<void> => {
+  try {
+    if (!(await requireAdmin(req, res))) return;
+
+    const body = req.body ?? {};
+    const title =
+      typeof body.title === "string" ? body.title.trim() : "";
+    const message =
+      typeof body.message === "string" ? body.message.trim() : "";
+    const discountPercent = Number(body.discountPercent);
+    const activeDays = Array.isArray(body.activeDays)
+      ? body.activeDays.filter(
+          (day: unknown): day is string =>
+            typeof day === "string" &&
+            ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"].includes(day)
+        )
+      : [];
+    const categories = Array.isArray(body.categories)
+      ? body.categories
+          .filter(
+            (category: unknown): category is string =>
+              typeof category === "string" && category.trim().length > 0
+          )
+          .map((category: string) => category.trim())
+      : [];
+    const isActive = body.isActive;
+
+    if (
+      !title ||
+      title.length > 100 ||
+      !message ||
+      message.length > 300 ||
+      !Number.isInteger(discountPercent) ||
+      discountPercent < 1 ||
+      discountPercent > 100 ||
+      typeof isActive !== "boolean" ||
+      activeDays.length === 0 ||
+      categories.length === 0
+    ) {
+      res.status(400).json({
+        success: false,
+        message:
+          "Provide a title, message, discount from 1 to 100, at least one active day and category, and an active status.",
+      });
+      return;
+    }
+
+    const now = new Date();
+    const offer = {
+      title,
+      message,
+      discountPercent,
+      activeDays: [...new Set(activeDays)],
+      categories: [...new Set(categories)],
+      isActive,
+      updatedAt: now,
+    };
+
+    await database.collection("offerSettings").updateOne(
+      { _id: OFFER_SETTINGS_ID } as any,
+      {
+        $set: offer,
+        $setOnInsert: { createdAt: now },
+      },
+      { upsert: true }
+    );
+
+    res.json({
+      success: true,
+      message: "Offer settings saved successfully.",
+      offer,
+    });
+  } catch (error) {
+    console.error("Could not save offer settings:", error);
+    res.status(500).json({
+      success: false,
+      message: "Could not save offer settings.",
+    });
+  }
+});
 export default adminRouter;
+
+
+
 
 
 

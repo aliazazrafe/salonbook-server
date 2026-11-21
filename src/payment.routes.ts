@@ -7,6 +7,13 @@ import { auth, database } from "./auth.js";
 const paymentRouter = Router();
 const stripeWebhookRouter = Router();
 
+const DEFAULT_OFFER = {
+  active: true,
+  discountPercent: 47,
+  days: ["Friday", "Monday"],
+  categories: ["Skin Care", "Hair Treatment", "Spa & Massage"],
+};
+
 function getStripe() {
   const secretKey = process.env.STRIPE_SECRET_KEY;
 
@@ -15,6 +22,103 @@ function getStripe() {
   }
 
   return new Stripe(secretKey);
+}
+
+function getAppointmentWeekday(dateValue: unknown): string {
+  if (typeof dateValue !== "string") return "";
+
+  const match = /^(\d{4})-(\d{2})-(\d{2})/.exec(dateValue);
+  if (!match) return "";
+
+  const [, year, month, day] = match;
+  const date = new Date(Date.UTC(Number(year), Number(month) - 1, Number(day)));
+
+  return date.toLocaleDateString("en-US", {
+    weekday: "long",
+    timeZone: "UTC",
+  });
+}
+
+function asStringArray(value: unknown, fallback: string[]): string[] {
+  if (Array.isArray(value)) {
+    return value.filter((item): item is string => typeof item === "string");
+  }
+
+  if (typeof value === "string" && value.trim()) {
+    return value.split(",").map((item) => item.trim()).filter(Boolean);
+  }
+
+  return fallback;
+}
+
+async function calculateAppointmentPrice(
+  service: Record<string, unknown> | null,
+  appointment: Record<string, unknown>
+) {
+  const regularPrice = Number(service?.price);
+
+  if (!Number.isFinite(regularPrice) || regularPrice <= 0) {
+    throw new Error("Could not find a valid price for this service.");
+  }
+
+  const settings = await database
+    .collection("offerSettings")
+    .findOne({ _id: "salonbook-weekly-offer" } as any);
+
+  const offer: Record<string, unknown> = (settings || DEFAULT_OFFER) as Record<string, unknown>;
+  const isActive = offer.isActive ?? offer.active ?? true;
+  const discountPercent = Number(
+    offer.discountPercent ?? offer.percentage ?? offer.percent ?? 47
+  );
+  const offerDays = asStringArray(
+    offer.activeDays ?? offer.days ?? offer.applicableDays,
+    DEFAULT_OFFER.days
+  );
+  const offerCategories = asStringArray(
+    offer.categories ?? offer.applicableCategories,
+    DEFAULT_OFFER.categories
+  );
+
+  const serviceName = String(
+    service?.serviceName ?? service?.name ?? appointment.service ?? ""
+  );
+  const serviceCategory = String(service?.category ?? "");
+
+  const categoryEligible = offerCategories.some((category) => {
+    const normalizedCategory = category.toLowerCase();
+    return (
+      serviceCategory.toLowerCase().includes(normalizedCategory) ||
+      normalizedCategory.includes(serviceCategory.toLowerCase())
+    );
+  });
+
+  const nameEligible = /spa|massage/i.test(serviceName);
+  const weekday = getAppointmentWeekday(appointment.date);
+  const dayEligible = offerDays.some(
+    (day) => day.toLowerCase() === weekday.toLowerCase()
+  );
+
+  const offerApplied =
+    Boolean(isActive) &&
+    dayEligible &&
+    (categoryEligible || nameEligible) &&
+    Number.isFinite(discountPercent) &&
+    discountPercent > 0 &&
+    discountPercent < 100;
+
+  const appliedPercent = offerApplied ? discountPercent : 0;
+  const finalPrice = offerApplied
+    ? Math.round(regularPrice * (100 - appliedPercent) / 100)
+    : Math.round(regularPrice);
+
+  return {
+    regularPrice: Math.round(regularPrice),
+    discountPercent: appliedPercent,
+    discountAmount: Math.round(regularPrice) - finalPrice,
+    finalPrice,
+    offerApplied,
+    weekday,
+  };
 }
 
 paymentRouter.post("/checkout-session", async (req, res): Promise<void> => {
@@ -81,15 +185,10 @@ paymentRouter.post("/checkout-session", async (req, res): Promise<void> => {
       ],
     });
 
-    const price = Number(service?.price);
-
-    if (!Number.isFinite(price) || price <= 0) {
-      res.status(400).json({
-        success: false,
-        message: "Could not find a valid price for this service.",
-      });
-      return;
-    }
+    const priceDetails = await calculateAppointmentPrice(
+      service as Record<string, unknown> | null,
+      appointment
+    );
 
     const clientUrl = (
       process.env.CLIENT_URL || "http://localhost:3000"
@@ -101,9 +200,14 @@ paymentRouter.post("/checkout-session", async (req, res): Promise<void> => {
         {
           price_data: {
             currency: "bdt",
-            unit_amount: Math.round(price * 100),
+            unit_amount: priceDetails.finalPrice * 100,
             product_data: {
-              name: String(appointment.service),
+              name: priceDetails.offerApplied
+                ? `${String(appointment.service)} (${priceDetails.discountPercent}% off)`
+                : String(appointment.service),
+              description: priceDetails.offerApplied
+                ? `Regular price ৳${priceDetails.regularPrice}; offer price ৳${priceDetails.finalPrice}`
+                : undefined,
             },
           },
           quantity: 1,
@@ -112,6 +216,11 @@ paymentRouter.post("/checkout-session", async (req, res): Promise<void> => {
       metadata: {
         appointmentId,
         userId: session.user.id,
+        regularPrice: String(priceDetails.regularPrice),
+        discountPercent: String(priceDetails.discountPercent),
+        discountAmount: String(priceDetails.discountAmount),
+        finalPrice: String(priceDetails.finalPrice),
+        offerApplied: String(priceDetails.offerApplied),
       },
       success_url: `${clientUrl}/payment/success?session_id={CHECKOUT_SESSION_ID}`,
       cancel_url: `${clientUrl}/payment/cancel?appointmentId=${appointmentId}`,
@@ -121,6 +230,11 @@ paymentRouter.post("/checkout-session", async (req, res): Promise<void> => {
       { _id: new ObjectId(appointmentId), userId: session.user.id },
       {
         $set: {
+          regularPrice: priceDetails.regularPrice,
+          discountPercent: priceDetails.discountPercent,
+          discountAmount: priceDetails.discountAmount,
+          finalPrice: priceDetails.finalPrice,
+          offerApplied: priceDetails.offerApplied,
           stripeCheckoutSessionId: checkoutSession.id,
           updatedAt: new Date(),
         },
@@ -130,6 +244,10 @@ paymentRouter.post("/checkout-session", async (req, res): Promise<void> => {
     res.json({
       success: true,
       url: checkoutSession.url,
+      price: priceDetails.finalPrice,
+      regularPrice: priceDetails.regularPrice,
+      discountPercent: priceDetails.discountPercent,
+      offerApplied: priceDetails.offerApplied,
     });
   } catch (error) {
     console.error("Could not create Stripe Checkout session:", error);
